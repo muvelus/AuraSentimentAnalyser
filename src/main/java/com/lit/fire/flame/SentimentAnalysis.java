@@ -45,8 +45,41 @@ public class SentimentAnalysis {
             processTable(conn, "x_posts");
             processTable(conn, "instagram_posts");
             processTable(conn, "youtube_comments");
+            processRedditPosts(conn);
         } catch (SQLException e) {
             e.printStackTrace();
+        }
+    }
+
+    private static void processRedditPosts(Connection conn) throws SQLException {
+        String sql = "SELECT id, title, text, keyword FROM reddit_posts WHERE sentiment_score IS NULL OR sentiment_score = 0";
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+
+            while (rs.next()) {
+                String id = rs.getString("id");
+                String title = rs.getString("title");
+                String text = rs.getString("text");
+                String keyword = rs.getString("keyword");
+
+                if (keyword != null && !keyword.trim().isEmpty()) {
+                    try {
+                        int score;
+                        if (text != null && !text.trim().isEmpty()) {
+                            int titleScore = getAverageSentimentScore(title, keyword);
+                            int textScore = getAverageSentimentScore(text, keyword);
+                            score = (titleScore + textScore) / 2;
+                        } else {
+                            score = getAverageSentimentScore(title, keyword);
+                        }
+                        System.out.println("Updating sentiment score for id: " + id + ", keyword: " + keyword + ", score: " + score);
+                        updateSentimentScore(conn, "reddit_posts", id, score);
+                    } catch (IOException e) {
+                        System.err.println("Error calling sentiment analysis API for reddit_posts ID: " + id);
+                        e.printStackTrace();
+                    }
+                }
+            }
         }
     }
 
