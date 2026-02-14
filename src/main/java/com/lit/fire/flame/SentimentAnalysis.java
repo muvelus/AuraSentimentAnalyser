@@ -52,7 +52,8 @@ public class SentimentAnalysis {
     }
 
     private static void processRedditPosts(Connection conn) throws SQLException {
-        String sql = "SELECT id, title, text, keyword FROM reddit_posts WHERE sentiment_score IS NULL OR sentiment_score = 0";
+//        String sql = "SELECT id, title, text, keyword FROM reddit_posts WHERE sentiment_score IS NULL OR sentiment_score = 0";
+        String sql = "SELECT id, title, text, keyword FROM reddit_posts WHERE sentiment_score IS NULL OR sentiment_score != -1";
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
 
@@ -116,6 +117,8 @@ public class SentimentAnalysis {
             if (score >= 0) {
                 totalScore += score;
                 validScoreCount++;
+            } else {
+                return 0;
             }
         }
 
