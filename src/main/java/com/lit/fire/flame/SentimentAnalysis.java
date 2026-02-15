@@ -52,8 +52,7 @@ public class SentimentAnalysis {
     }
 
     private static void processRedditPosts(Connection conn) throws SQLException {
-//        String sql = "SELECT id, title, text, keyword FROM reddit_posts WHERE sentiment_score IS NULL OR sentiment_score = 0";
-        String sql = "SELECT id, title, text, keyword FROM reddit_posts WHERE sentiment_score IS NULL OR sentiment_score != -1";
+        String sql = "SELECT id, title, text, keyword FROM reddit_posts WHERE sentiment_score IS NULL OR sentiment_score = 0";
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
 
@@ -86,6 +85,7 @@ public class SentimentAnalysis {
 
     private static void processTable(Connection conn, String tableName) throws SQLException {
         String sql = "SELECT id, text, keyword FROM " + tableName + " WHERE sentiment_score IS NULL OR sentiment_score = 0";
+//        String sql = "SELECT id, text, keyword FROM " + tableName + " WHERE sentiment_score IS NULL OR sentiment_score != 0";
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
 
@@ -130,49 +130,64 @@ public class SentimentAnalysis {
     }
 
     private static int callSentimentApi(String text, String keyword) throws IOException {
-        try (CloseableHttpClient httpClient = HttpClients.createDefault()) {
-            HttpPost httpPost = new HttpPost(LLM_URL);
-            Gson gson = new Gson();
+        int maxRetries = 20;
+        int retryCount = 0;
+        while (true) {
+            try (CloseableHttpClient httpClient = HttpClients.createDefault()) {
+                HttpPost httpPost = new HttpPost(LLM_URL);
+                Gson gson = new Gson();
 
-            String promptString = PROMPT_TEMPLATE.replace("{keyword}", keyword).replace("{text}", text);
-            PromptRequest payload = new PromptRequest(promptString);
-            String jsonPayload = gson.toJson(payload);
+                String promptString = PROMPT_TEMPLATE.replace("{keyword}", keyword).replace("{text}", text);
+                PromptRequest payload = new PromptRequest(promptString);
+                String jsonPayload = gson.toJson(payload);
 
-            StringEntity entity = new StringEntity(jsonPayload, "UTF-8");
-            httpPost.setEntity(entity);
-            httpPost.setHeader("Accept", "application/json");
-            httpPost.setHeader("Content-type", "application/json; charset=UTF-8");
+                StringEntity entity = new StringEntity(jsonPayload, "UTF-8");
+                httpPost.setEntity(entity);
+                httpPost.setHeader("Accept", "application/json");
+                httpPost.setHeader("Content-type", "application/json; charset=UTF-8");
 
-            try (CloseableHttpResponse response = httpClient.execute(httpPost)) {
-                String responseString = EntityUtils.toString(response.getEntity());
-                System.out.println("Raw response from LLM: " + responseString);
+                try (CloseableHttpResponse response = httpClient.execute(httpPost)) {
+                    String responseString = EntityUtils.toString(response.getEntity());
+                    System.out.println("Raw response from LLM: " + responseString);
 
-                String jsonResponse = null;
-                int firstBrace = responseString.indexOf('{');
-                int lastBrace = responseString.lastIndexOf('}');
+                    String jsonResponse = null;
+                    int firstBrace = responseString.indexOf('{');
+                    int lastBrace = responseString.lastIndexOf('}');
 
-                if (firstBrace != -1 && lastBrace != -1 && lastBrace > firstBrace) {
-                    jsonResponse = responseString.substring(firstBrace, lastBrace + 1);
+                    if (firstBrace != -1 && lastBrace != -1 && lastBrace > firstBrace) {
+                        jsonResponse = responseString.substring(firstBrace, lastBrace + 1);
+                    }
+
+                    if (jsonResponse == null) {
+                        System.err.println("Could not find a valid JSON object in the response.");
+                        return 0;
+                    }
+
+                    SentimentResponse sentimentResponse = null;
+                    try {
+                        sentimentResponse = gson.fromJson(jsonResponse, SentimentResponse.class);
+                    } catch (JsonSyntaxException e) {
+                        System.err.println("Failed to parse extracted JSON: " + jsonResponse);
+                        return 0;
+                    }
+
+                    if (sentimentResponse == null) {
+                        System.err.println("Failed to parse JSON response: " + jsonResponse);
+                        return 0;
+                    }
+                    return (int) Math.round(sentimentResponse.getPositivityScore());
                 }
-
-                if (jsonResponse == null) {
-                    System.err.println("Could not find a valid JSON object in the response.");
-                    return 0;
+            } catch (IOException e) {
+                if (++retryCount >= maxRetries) {
+                    throw e;
                 }
-
-                SentimentResponse sentimentResponse = null;
+                System.err.println("LLM service is not reachable. Retrying in 30 seconds...");
                 try {
-                    sentimentResponse = gson.fromJson(jsonResponse, SentimentResponse.class);
-                } catch (JsonSyntaxException e) {
-                    System.err.println("Failed to parse extracted JSON: " + jsonResponse);
-                    return 0;
+                    Thread.sleep(30000);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted while waiting to retry", ie);
                 }
-
-                if (sentimentResponse == null) {
-                    System.err.println("Failed to parse JSON response: " + jsonResponse);
-                    return 0;
-                }
-                return (int) Math.round(sentimentResponse.getPositivityScore());
             }
         }
     }
