@@ -12,15 +12,22 @@ import org.apache.http.util.EntityUtils;
 import java.io.IOException;
 import java.io.InputStream;
 import java.sql.*;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Properties;
 
 public class SentimentAnalysis {
 
+    private static int NUMBER_OR_SENTIMENT_ANALYSIS_RETRIES = 3;
     private static final String DB_URL;
     private static final String USER;
     private static final String PASS;
     private static final String LLM_URL;
-    private static final String PROMPT_TEMPLATE;
+    private static final String PROMPT_MEDIA_MOVIE_TEMPLATE;
+    private static final String PROMPT_MEDIA_CELEBRITY_TEMPLATE;
+    private static final String PROMPT_POLITICS_POLITICIAN_TEMPLATE;
+    private static final String PROMPT_POLITICS_CAMPAIGN_TEMPLATE;
+    private static final String PROMPT_POLITICS_PARTY_TEMPLATE;
 
     static {
         Properties props = new Properties();
@@ -30,11 +37,16 @@ public class SentimentAnalysis {
                 throw new RuntimeException("application.properties not found in the classpath");
             }
             props.load(input);
+            NUMBER_OR_SENTIMENT_ANALYSIS_RETRIES = Integer.parseInt(props.getProperty("sentiment.analysis.retries", "3"));
             DB_URL = props.getProperty("db.url");
             USER = props.getProperty("db.user");
             PASS = props.getProperty("db.password");
             LLM_URL = props.getProperty("llm.url");
-            PROMPT_TEMPLATE = props.getProperty("prompt");
+            PROMPT_MEDIA_MOVIE_TEMPLATE = props.getProperty("prompt.media.movie");
+            PROMPT_MEDIA_CELEBRITY_TEMPLATE = props.getProperty("prompt.media.celebrity");
+            PROMPT_POLITICS_POLITICIAN_TEMPLATE = props.getProperty("prompt.politics.politician");
+            PROMPT_POLITICS_CAMPAIGN_TEMPLATE = props.getProperty("prompt.politics.campaign");
+            PROMPT_POLITICS_PARTY_TEMPLATE = props.getProperty("prompt.politics.party");
         } catch (IOException ex) {
             throw new RuntimeException("Error loading application.properties", ex);
         }
@@ -64,16 +76,18 @@ public class SentimentAnalysis {
 
                 if (keyword != null && !keyword.trim().isEmpty()) {
                     try {
-                        int score;
+                        SentimentResponse sentimentResponse;
                         if (text != null && !text.trim().isEmpty()) {
-                            int titleScore = getAverageSentimentScore(title, keyword);
-                            int textScore = getAverageSentimentScore(text, keyword);
-                            score = (titleScore + textScore) / 2;
+                            SentimentResponse titleSentiment = getAverageSentimentScore(title, keyword);
+                            SentimentResponse textSentiment = getAverageSentimentScore(text, keyword);
+                            sentimentResponse = new SentimentResponse();
+                            sentimentResponse.setPositivityScore((titleSentiment.getPositivityScore() + textSentiment.getPositivityScore()) / 2);
+                            sentimentResponse.setCategory(textSentiment.getCategory());
                         } else {
-                            score = getAverageSentimentScore(title, keyword);
+                            sentimentResponse = getAverageSentimentScore(title, keyword);
                         }
-                        System.out.println("Updating sentiment score for id: " + id + ", keyword: " + keyword + ", score: " + score);
-                        updateSentimentScore(conn, "reddit_posts", id, score);
+                        System.out.println("Updating sentiment score for id: " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
+                        updateSentimentScore(conn, "reddit_posts", id, sentimentResponse);
                     } catch (IOException e) {
                         System.err.println("Error calling sentiment analysis API for reddit_posts ID: " + id);
                         e.printStackTrace();
@@ -84,7 +98,7 @@ public class SentimentAnalysis {
     }
 
     private static void processTable(Connection conn, String tableName) throws SQLException {
-        String sql = "SELECT id, text, keyword FROM " + tableName + " WHERE sentiment_score IS NULL OR sentiment_score = 0";
+        String sql = "SELECT id, text, keyword FROM " + tableName + " WHERE sentiment_score IS NULL OR sentiment_score > -1";
 //        String sql = "SELECT id, text, keyword FROM " + tableName + " WHERE sentiment_score IS NULL OR sentiment_score != 0";
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
@@ -96,9 +110,9 @@ public class SentimentAnalysis {
 
                 if (text != null && !text.trim().isEmpty() && keyword != null && !keyword.trim().isEmpty()) {
                     try {
-                        int averageSentimentScore = getAverageSentimentScore(text, keyword);
-                        System.out.println("Updating sentiment score for id: " + id + ", keyword: " + keyword + ", score: " + averageSentimentScore);
-                        updateSentimentScore(conn, tableName, id, averageSentimentScore);
+                        SentimentResponse sentimentResponse = getAverageSentimentScore(text, keyword);
+                        System.out.println("Updating sentiment score for id: " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
+                        updateSentimentScore(conn, tableName, id, sentimentResponse);
                     } catch (IOException e) {
                         System.err.println("Error calling sentiment analysis API for " + tableName + " ID: " + id);
                         e.printStackTrace();
@@ -108,28 +122,49 @@ public class SentimentAnalysis {
         }
     }
 
-    private static int getAverageSentimentScore(String text, String keyword) throws IOException {
-        int totalScore = 0;
-        int validScoreCount = 0;
-        int numberOfCalls = 3;
-        for (int i = 0; i < numberOfCalls; i++) {
-            int score = callSentimentApi(text, keyword);
-            if (score >= 0) {
-                totalScore += score;
-                validScoreCount++;
-            } else {
-                return 0;
+    private static SentimentResponse getAverageSentimentScore(String text, String keyword) throws IOException {
+        SentimentResponse sentimentResponse = new SentimentResponse();
+        List<String> prompts = Arrays.asList(
+                PROMPT_MEDIA_MOVIE_TEMPLATE,
+                PROMPT_MEDIA_CELEBRITY_TEMPLATE,
+                PROMPT_POLITICS_POLITICIAN_TEMPLATE,
+                PROMPT_POLITICS_CAMPAIGN_TEMPLATE,
+                PROMPT_POLITICS_PARTY_TEMPLATE
+        );
+
+        for (String prompt : prompts) {
+            int totalScore = 0;
+            int validScoreCount = 0;
+
+            for (int i=0; i<3; i++) {
+                sentimentResponse = callSentimentApi(prompt, text, keyword);
+                int score = (int) Math.round(sentimentResponse.getPositivityScore());
+
+                if (score >= 0) {
+                    totalScore += score;
+                    validScoreCount++;
+                } else {
+                    validScoreCount = 0;
+                    break;
+                }
             }
+
+            if (validScoreCount == 0) {
+                continue;
+            }
+
+            SentimentResponse avgSentimentResponse = new SentimentResponse();
+            avgSentimentResponse.setCategory(sentimentResponse.getCategory());
+            avgSentimentResponse.setPositivityScore(Math.round((float) totalScore / validScoreCount));
+
+            return avgSentimentResponse;
         }
 
-        if (validScoreCount == 0) {
-            return 0;
-        }
-
-        return Math.round((float) totalScore / validScoreCount);
+        // Invalid for ALL categories i.e. movie, celebrity, politician, political campaign or political party
+        return sentimentResponse;
     }
 
-    private static int callSentimentApi(String text, String keyword) throws IOException {
+    private static SentimentResponse callSentimentApi(String promptTemplate, String text, String keyword) throws IOException {
         int maxRetries = 20;
         int retryCount = 0;
         while (true) {
@@ -137,7 +172,7 @@ public class SentimentAnalysis {
                 HttpPost httpPost = new HttpPost(LLM_URL);
                 Gson gson = new Gson();
 
-                String promptString = PROMPT_TEMPLATE.replace("{keyword}", keyword).replace("{text}", text);
+                String promptString = promptTemplate.replace("{keyword}", keyword).replace("{text}", text);
                 PromptRequest payload = new PromptRequest(promptString);
                 String jsonPayload = gson.toJson(payload);
 
@@ -160,7 +195,7 @@ public class SentimentAnalysis {
 
                     if (jsonResponse == null) {
                         System.err.println("Could not find a valid JSON object in the response.");
-                        return 0;
+                        return new SentimentResponse();
                     }
 
                     SentimentResponse sentimentResponse = null;
@@ -168,14 +203,15 @@ public class SentimentAnalysis {
                         sentimentResponse = gson.fromJson(jsonResponse, SentimentResponse.class);
                     } catch (JsonSyntaxException e) {
                         System.err.println("Failed to parse extracted JSON: " + jsonResponse);
-                        return 0;
+                        return new SentimentResponse();
                     }
 
                     if (sentimentResponse == null) {
                         System.err.println("Failed to parse JSON response: " + jsonResponse);
-                        return 0;
+                        return new SentimentResponse();
                     }
-                    return (int) Math.round(sentimentResponse.getPositivityScore());
+//                    return (int) Math.round(sentimentResponse.getPositivityScore());
+                    return sentimentResponse;
                 }
             } catch (IOException e) {
                 if (++retryCount >= maxRetries) {
@@ -192,11 +228,15 @@ public class SentimentAnalysis {
         }
     }
 
-    private static void updateSentimentScore(Connection conn, String tableName, String id, int sentimentScore) throws SQLException {
-        String sql = "UPDATE " + tableName + " SET sentiment_score = ? WHERE id = ?";
+    private static void updateSentimentScore(Connection conn, String tableName, String id, SentimentResponse sentimentResponse) throws SQLException {
+        int sentimentScore = (int) Math.round(sentimentResponse.getPositivityScore());
+        sentimentScore = sentimentScore < 0 ? 0 : sentimentScore;
+        String category = sentimentResponse.getCategory();
+        String sql = "UPDATE " + tableName + " SET sentiment_score = ?, sentiment_category = ? WHERE id = ?";
         try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
             pstmt.setInt(1, sentimentScore);
-            pstmt.setString(2, id);
+            pstmt.setString(2, category);
+            pstmt.setString(3, id);
             pstmt.executeUpdate();
         }
     }
@@ -210,10 +250,28 @@ public class SentimentAnalysis {
     }
 
     private static class SentimentResponse {
+        private String category;
         private double positivity_score;
+
+        SentimentResponse() {
+            this.category = "invalid";
+            this.positivity_score = 0;
+        }
 
         public double getPositivityScore() {
             return positivity_score;
+        }
+
+        public String getCategory() {
+            return category;
+        }
+
+        public void setCategory(String category) {
+            this.category = category;
+        }
+
+        public void setPositivityScore(double positivityScore) {
+            this.positivity_score = positivityScore;
         }
     }
 }
