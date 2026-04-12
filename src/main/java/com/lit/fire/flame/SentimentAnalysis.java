@@ -155,8 +155,10 @@ public class SentimentAnalysis {
             }
 
             SentimentResponse avgSentimentResponse = new SentimentResponse();
-            avgSentimentResponse.setCategory(sentimentResponse.getCategory());
-            avgSentimentResponse.setPositivityScore(Math.round((float) totalScore / validScoreCount));
+            int score = Math.round((float) totalScore / validScoreCount);
+            String category = (score > 0) ? sentimentResponse.getCategory() : "invalid";
+            avgSentimentResponse.setCategory(category);
+            avgSentimentResponse.setPositivityScore(score);
 
             return avgSentimentResponse;
         }
