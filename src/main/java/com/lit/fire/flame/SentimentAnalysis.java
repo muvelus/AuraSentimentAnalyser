@@ -98,8 +98,9 @@ public class SentimentAnalysis {
     }
 
     private static void processTable(Connection conn, String tableName) throws SQLException {
-        String sql = "SELECT id, text, keyword FROM " + tableName + " WHERE sentiment_score IS NULL OR sentiment_score > -1";
-//        String sql = "SELECT id, text, keyword FROM " + tableName + " WHERE sentiment_score IS NULL OR sentiment_score != 0";
+        String sql = "SELECT id, text, keyword FROM " + tableName + " WHERE sentiment_score IS NULL OR sentiment_score > -1";//v2
+//Orig        String sql = "SELECT id, text, keyword FROM " + tableName + " WHERE sentiment_score IS NULL OR sentiment_score != 0";
+//        String sql = "SELECT id, text, keyword FROM " + tableName + " WHERE keyword = 'GDN' OR keyword = 'GDNaidu'";
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
 
