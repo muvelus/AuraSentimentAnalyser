@@ -29,6 +29,10 @@ public class SentimentAnalysis {
     private static final String PROMPT_MEDIA_MOVIE_POSITIVE_TEMPLATE;
     private static final String PROMPT_MEDIA_MOVIE_NEGATIVE_TEMPLATE;
     private static final String PROMPT_MEDIA_MOVIE_NEUTRAL_TEMPLATE;
+    private static final String PROMPT_MEDIA_CELEBRITY_INVALID_TEMPLATE;
+    private static final String PROMPT_MEDIA_CELEBRITY_POSITIVE_TEMPLATE;
+    private static final String PROMPT_MEDIA_CELEBRITY_NEGATIVE_TEMPLATE;
+    private static final String PROMPT_MEDIA_CELEBRITY_NEUTRAL_TEMPLATE;
     private static final String PROMPT_MEDIA_CELEBRITY_TEMPLATE;
     private static final String PROMPT_POLITICS_POLITICIAN_TEMPLATE;
     private static final String PROMPT_POLITICS_CAMPAIGN_TEMPLATE;
@@ -51,6 +55,10 @@ public class SentimentAnalysis {
             PROMPT_MEDIA_MOVIE_POSITIVE_TEMPLATE = props.getProperty("prompt.media.movie.positive");
             PROMPT_MEDIA_MOVIE_NEGATIVE_TEMPLATE = props.getProperty("prompt.media.movie.negative");
             PROMPT_MEDIA_MOVIE_NEUTRAL_TEMPLATE = props.getProperty("prompt.media.movie.neutral");
+            PROMPT_MEDIA_CELEBRITY_INVALID_TEMPLATE = props.getProperty("prompt.media.celebrity.invalid");
+            PROMPT_MEDIA_CELEBRITY_POSITIVE_TEMPLATE = props.getProperty("prompt.media.celebrity.positive");
+            PROMPT_MEDIA_CELEBRITY_NEGATIVE_TEMPLATE = props.getProperty("prompt.media.celebrity.negative");
+            PROMPT_MEDIA_CELEBRITY_NEUTRAL_TEMPLATE = props.getProperty("prompt.media.celebrity.neutral");
             PROMPT_MEDIA_CELEBRITY_TEMPLATE = props.getProperty("prompt.media.celebrity");
             PROMPT_POLITICS_POLITICIAN_TEMPLATE = props.getProperty("prompt.politics.politician");
             PROMPT_POLITICS_CAMPAIGN_TEMPLATE = props.getProperty("prompt.politics.campaign");
@@ -315,6 +323,10 @@ public class SentimentAnalysis {
         prompts.put("media.movie.negative", PROMPT_MEDIA_MOVIE_NEGATIVE_TEMPLATE);
         prompts.put("media.movie.neutral", PROMPT_MEDIA_MOVIE_NEUTRAL_TEMPLATE);
         prompts.put("media.celebrity", PROMPT_MEDIA_CELEBRITY_TEMPLATE);
+        prompts.put("media.celebrity.invalid", PROMPT_MEDIA_CELEBRITY_INVALID_TEMPLATE);
+        prompts.put("media.celebrity.positive", PROMPT_MEDIA_CELEBRITY_POSITIVE_TEMPLATE);
+        prompts.put("media.celebrity.negative", PROMPT_MEDIA_CELEBRITY_NEGATIVE_TEMPLATE);
+        prompts.put("media.celebrity.neutral", PROMPT_MEDIA_CELEBRITY_NEUTRAL_TEMPLATE);
         prompts.put("politics.politician", PROMPT_POLITICS_POLITICIAN_TEMPLATE);
         prompts.put("politics.campaign", PROMPT_POLITICS_CAMPAIGN_TEMPLATE);
         prompts.put("politics.party", PROMPT_POLITICS_PARTY_TEMPLATE);
@@ -342,6 +354,10 @@ public class SentimentAnalysis {
 
         String prompt = prompts.get(category);
         System.out.println("Category: " + category);
+        if (prompt == null) {
+            System.out.println("Prompt is null for : " + category + " for keyword : " + keyword);
+            return sentimentResponse;
+        }
 
         for (int i=0; i<3; i++) {
             sentimentResponse = callSentimentApi(prompt, text, keyword);
