@@ -69,60 +69,76 @@ public class SentimentAnalysis {
     }
 
     public static void main(String[] args) {
-        ExecutorService executor = Executors.newFixedThreadPool(10);
+        ExecutorService executor = Executors.newFixedThreadPool(3);
         try {
             executor.submit(() -> {
                 try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
                     processTable(conn, "x_posts");
+//                    processTable(conn, "instagram_posts");
+                    processTable(conn, "youtube_comments");
+//                    processRedditPosts(conn);
                 } catch (SQLException e) {
                     System.err.println("Error processing x_posts: " + e.getMessage());
                 }
             });
-            executor.submit(() -> {
-                try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
-                    processTable(conn, "instagram_posts");
-                } catch (SQLException e) {
-                    System.err.println("Error processing instagram_posts: " + e.getMessage());
-                }
-            });
-            executor.submit(() -> {
-                try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
-                    processTable(conn, "youtube_comments");
-                } catch (SQLException e) {
-                    System.err.println("Error processing youtube_comments: " + e.getMessage());
-                }
-            });
-            executor.submit(() -> {
-                try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
-                    processRedditPosts(conn);
-                } catch (SQLException e) {
-                    System.err.println("Error processing reddit_posts: " + e.getMessage());
-                }
-            });
+//            executor.submit(() -> {
+//                try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
+//                    processTable(conn, "instagram_posts");
+//                } catch (SQLException e) {
+//                    System.err.println("Error processing instagram_posts: " + e.getMessage());
+//                }
+//            });
+//            executor.submit(() -> {
+//                try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
+//                    processTable(conn, "youtube_comments");
+//                } catch (SQLException e) {
+//                    System.err.println("Error processing youtube_comments: " + e.getMessage());
+//                }
+//            });
+//            executor.submit(() -> {
+//                try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
+//                    processRedditPosts(conn);
+//                } catch (SQLException e) {
+//                    System.err.println("Error processing reddit_posts: " + e.getMessage());
+//                }
+//            });
             executor.submit(() -> {
                 try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
                     processTableFilterInvalidPosts(conn, "x_posts");
-                } catch (SQLException e) {
-                    System.err.println("Error processing x_posts: " + e.getMessage());
-                }
-            });
-            executor.submit(() -> {
-                try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
                     processTableFilterPositivePosts(conn, "x_posts");
-                } catch (SQLException e) {
-                    System.err.println("Error processing x_posts: " + e.getMessage());
-                }
-            });
-            executor.submit(() -> {
-                try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
                     processTableFilterNegativePosts(conn, "x_posts");
+                    processTableFilterNeutralPosts(conn, "x_posts");
                 } catch (SQLException e) {
                     System.err.println("Error processing x_posts: " + e.getMessage());
                 }
             });
+//            executor.submit(() -> {
+//                try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
+//                    processTableFilterPositivePosts(conn, "x_posts");
+//                } catch (SQLException e) {
+//                    System.err.println("Error processing x_posts: " + e.getMessage());
+//                }
+//            });
+//            executor.submit(() -> {
+//                try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
+//                    processTableFilterNegativePosts(conn, "x_posts");
+//                } catch (SQLException e) {
+//                    System.err.println("Error processing x_posts: " + e.getMessage());
+//                }
+//            });
+//            executor.submit(() -> {
+//                try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
+//                    processTableFilterNeutralPosts(conn, "x_posts");
+//                } catch (SQLException e) {
+//                    System.err.println("Error processing x_posts: " + e.getMessage());
+//                }
+//            });
             executor.submit(() -> {
                 try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
-                    processTableFilterNeutralPosts(conn, "x_posts");
+                    processTableFilterInvalidPosts(conn, "youtube_comments");
+                    processTableFilterPositivePosts(conn, "youtube_comments");
+                    processTableFilterNegativePosts(conn, "youtube_comments");
+                    processTableFilterNeutralPosts(conn, "youtube_comments");
                 } catch (SQLException e) {
                     System.err.println("Error processing x_posts: " + e.getMessage());
                 }
@@ -175,9 +191,9 @@ public class SentimentAnalysis {
     }
 
     private static void processTable(Connection conn, String tableName) throws SQLException {
-        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NULL OR sentiment_score > -1 AND sentiment_category IS NULL";//v2
+//        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NULL OR sentiment_score > -1";//v2
 //Orig        String sql = "SELECT id, text, keyword FROM " + tableName + " WHERE sentiment_score IS NULL OR sentiment_score != 0";
-//        String sql = "SELECT id, text, keyword FROM " + tableName + " WHERE keyword = 'GDN' OR keyword = 'GDNaidu'";
+        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE keyword = 'parasakthi' AND text LIKE '%oast%'";
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
 
@@ -201,7 +217,8 @@ public class SentimentAnalysis {
     }
 
     private static void processTableFilterInvalidPosts(Connection conn, String tableName) throws SQLException {
-        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NOT NULL AND sentiment_score > 0";//v2
+//        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NOT NULL AND sentiment_score > 0";//v2
+        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE keyword = 'parasakthi' AND text LIKE '%oast%'";
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
 
