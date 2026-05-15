@@ -69,7 +69,7 @@ public class SentimentAnalysis {
     }
 
     public static void main(String[] args) {
-        ExecutorService executor = Executors.newFixedThreadPool(3);
+        ExecutorService executor = Executors.newFixedThreadPool(1);
         try {
             executor.submit(() -> {
                 try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
@@ -102,16 +102,16 @@ public class SentimentAnalysis {
 //                    System.err.println("Error processing reddit_posts: " + e.getMessage());
 //                }
 //            });
-            executor.submit(() -> {
-                try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
-                    processTableFilterInvalidPosts(conn, "x_posts");
-                    processTableFilterPositivePosts(conn, "x_posts");
-                    processTableFilterNegativePosts(conn, "x_posts");
-                    processTableFilterNeutralPosts(conn, "x_posts");
-                } catch (SQLException e) {
-                    System.err.println("Error processing x_posts: " + e.getMessage());
-                }
-            });
+//            executor.submit(() -> {
+//                try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
+////                    processTableFilterInvalidPosts(conn, "x_posts");
+////                    processTableFilterPositivePosts(conn, "x_posts");
+////                    processTableFilterNegativePosts(conn, "x_posts");
+////                    processTableFilterNeutralPosts(conn, "x_posts");
+//                } catch (SQLException e) {
+//                    System.err.println("Error processing x_posts: " + e.getMessage());
+//                }
+//            });
 //            executor.submit(() -> {
 //                try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
 //                    processTableFilterPositivePosts(conn, "x_posts");
@@ -133,16 +133,16 @@ public class SentimentAnalysis {
 //                    System.err.println("Error processing x_posts: " + e.getMessage());
 //                }
 //            });
-            executor.submit(() -> {
-                try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
-                    processTableFilterInvalidPosts(conn, "youtube_comments");
-                    processTableFilterPositivePosts(conn, "youtube_comments");
-                    processTableFilterNegativePosts(conn, "youtube_comments");
-                    processTableFilterNeutralPosts(conn, "youtube_comments");
-                } catch (SQLException e) {
-                    System.err.println("Error processing x_posts: " + e.getMessage());
-                }
-            });
+//            executor.submit(() -> {
+//                try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
+////                    processTableFilterInvalidPosts(conn, "youtube_comments");
+////                    processTableFilterPositivePosts(conn, "youtube_comments");
+////                    processTableFilterNegativePosts(conn, "youtube_comments");
+////                    processTableFilterNeutralPosts(conn, "youtube_comments");
+//                } catch (SQLException e) {
+//                    System.err.println("Error processing x_posts: " + e.getMessage());
+//                }
+//            });
         } finally {
             executor.shutdown();
             try {
@@ -192,8 +192,9 @@ public class SentimentAnalysis {
 
     private static void processTable(Connection conn, String tableName) throws SQLException {
 //        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NULL OR sentiment_score > -1";//v2
-//Orig        String sql = "SELECT id, text, keyword FROM " + tableName + " WHERE sentiment_score IS NULL OR sentiment_score != 0";
-        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE keyword = 'parasakthi' AND text LIKE '%oast%'";
+//        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NULL OR sentiment_score = 0";
+        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NULL";
+//        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE keyword = 'parasakthi' AND text LIKE '%oast%'";
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
 
@@ -206,7 +207,7 @@ public class SentimentAnalysis {
                 if (text != null && !text.trim().isEmpty() && keyword != null && !keyword.trim().isEmpty()) {
                     try {
                         SentimentResponse sentimentResponse = getAverageSentimentScore(text, keyword, category);
-                        System.out.println("Updating sentiment score for id: " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
+                        System.out.println("Updating sentiment score for id (generic): " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
                         updateSentimentScore(conn, tableName, id, sentimentResponse);
                     } catch (IOException e) {
                         System.err.println("Error calling sentiment analysis API for " + tableName + " ID: " + id + ". " + e.getMessage());
@@ -217,8 +218,8 @@ public class SentimentAnalysis {
     }
 
     private static void processTableFilterInvalidPosts(Connection conn, String tableName) throws SQLException {
-//        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NOT NULL AND sentiment_score > 0";//v2
-        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE keyword = 'parasakthi' AND text LIKE '%oast%'";
+        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NOT NULL AND sentiment_score > 0";//v2
+//        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE keyword = 'parasakthi' AND text LIKE '%oast%'";
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
 
@@ -232,7 +233,7 @@ public class SentimentAnalysis {
                     try {
                         String tempCategory = category + ".invalid";
                         SentimentResponse sentimentResponse = getAverageSentimentScore(text, keyword, tempCategory);
-                        System.out.println("Updating sentiment score for id: " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
+                        System.out.println("Updating sentiment score for id (invalid posts): " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
                         if (sentimentResponse.getPositivityScore() <= 0) {
                             sentimentResponse.setCategory(category);
                             updateSentimentScore(conn, tableName, id, sentimentResponse);
@@ -260,7 +261,7 @@ public class SentimentAnalysis {
                     try {
                         String tempCategory = category + ".positive";
                         SentimentResponse sentimentResponse = getAverageSentimentScore(text, keyword, tempCategory);
-                        System.out.println("Updating sentiment score for id: " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
+                        System.out.println("Updating sentiment score for id (positive posts): " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
                         if (sentimentResponse.getPositivityScore() >= 75) {
                             sentimentResponse.setCategory(category);
                             updateSentimentScore(conn, tableName, id, sentimentResponse);
@@ -288,7 +289,7 @@ public class SentimentAnalysis {
                     try {
                         String tempCategory = category + ".negative";
                         SentimentResponse sentimentResponse = getAverageSentimentScore(text, keyword, tempCategory);
-                        System.out.println("Updating sentiment score for id: " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
+                        System.out.println("Updating sentiment score for id (negative posts): " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
                         if (sentimentResponse.getPositivityScore() <= 50) {
                             sentimentResponse.setCategory(category);
                             updateSentimentScore(conn, tableName, id, sentimentResponse);
@@ -316,7 +317,7 @@ public class SentimentAnalysis {
                     try {
                         String tempCategory = category + ".neutral";
                         SentimentResponse sentimentResponse = getAverageSentimentScore(text, keyword, tempCategory);
-                        System.out.println("Updating sentiment score for id: " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
+                        System.out.println("Updating sentiment score for id (neutral posts): " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
                         if (sentimentResponse.getPositivityScore() > 50 && sentimentResponse.getPositivityScore() < 75) {
                             sentimentResponse.setCategory(category);
                             updateSentimentScore(conn, tableName, id, sentimentResponse);
@@ -476,6 +477,10 @@ public class SentimentAnalysis {
 
     private static void updateSentimentScore(Connection conn, String tableName, String id, SentimentResponse sentimentResponse) throws SQLException {
         int sentimentScore = (int) Math.round(sentimentResponse.getPositivityScore());
+        if (sentimentScore > 100) {
+            System.err.println("Skipping update for " + tableName + " ID: " + id + " - LLM returned out-of-range score: " + sentimentScore);
+            return;
+        }
         sentimentScore = Math.max(sentimentScore, 0);
         String category = sentimentResponse.getCategory();
         String sql = "UPDATE " + tableName + " SET sentiment_score = ?, sentiment_category = ? WHERE id = ?";
