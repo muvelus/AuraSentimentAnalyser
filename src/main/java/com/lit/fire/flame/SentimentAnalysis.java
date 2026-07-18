@@ -72,11 +72,23 @@ public class SentimentAnalysis {
         ExecutorService executor = Executors.newFixedThreadPool(1);
         try {
             executor.submit(() -> {
+                // Poll continuously: drain both tables, wait, then re-check for rows that
+                // data collection inserted in the meantime. Runs until interrupted (e.g. on
+                // executor shutdown) or the connection drops.
+                long pollIntervalMillis = TimeUnit.MINUTES.toMillis(5);
                 try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
-                    processTable(conn, "x_posts");
-//                    processTable(conn, "instagram_posts");
-                    processTable(conn, "youtube_comments");
-//                    processRedditPosts(conn);
+                    while (!Thread.currentThread().isInterrupted()) {
+                        processTable(conn, "x_posts", "created_at");
+//                        processTable(conn, "instagram_posts", "created_at");
+                        processTable(conn, "youtube_comments", "published_at");
+//                        processRedditPosts(conn);
+                        try {
+                            Thread.sleep(pollIntervalMillis);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
+                    }
                 } catch (SQLException e) {
                     System.err.println("Error processing x_posts: " + e.getMessage());
                 }
@@ -102,16 +114,16 @@ public class SentimentAnalysis {
 //                    System.err.println("Error processing reddit_posts: " + e.getMessage());
 //                }
 //            });
-//            executor.submit(() -> {
-//                try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
-////                    processTableFilterInvalidPosts(conn, "x_posts");
-////                    processTableFilterPositivePosts(conn, "x_posts");
-////                    processTableFilterNegativePosts(conn, "x_posts");
-////                    processTableFilterNeutralPosts(conn, "x_posts");
-//                } catch (SQLException e) {
-//                    System.err.println("Error processing x_posts: " + e.getMessage());
-//                }
-//            });
+            executor.submit(() -> {
+                try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
+                    processTableFilterInvalidPosts(conn, "x_posts", "created_at");
+                    processTableFilterPositivePosts(conn, "x_posts", "created_at");
+                    processTableFilterNegativePosts(conn, "x_posts", "created_at");
+                    processTableFilterNeutralPosts(conn, "x_posts", "created_at");
+                } catch (SQLException e) {
+                    System.err.println("Error processing x_posts: " + e.getMessage());
+                }
+            });
 //            executor.submit(() -> {
 //                try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
 //                    processTableFilterPositivePosts(conn, "x_posts");
@@ -133,16 +145,16 @@ public class SentimentAnalysis {
 //                    System.err.println("Error processing x_posts: " + e.getMessage());
 //                }
 //            });
-//            executor.submit(() -> {
-//                try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
-////                    processTableFilterInvalidPosts(conn, "youtube_comments");
-////                    processTableFilterPositivePosts(conn, "youtube_comments");
-////                    processTableFilterNegativePosts(conn, "youtube_comments");
-////                    processTableFilterNeutralPosts(conn, "youtube_comments");
-//                } catch (SQLException e) {
-//                    System.err.println("Error processing x_posts: " + e.getMessage());
-//                }
-//            });
+            executor.submit(() -> {
+                try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
+                    processTableFilterInvalidPosts(conn, "youtube_comments", "published_at");
+                    processTableFilterPositivePosts(conn, "youtube_comments", "published_at");
+                    processTableFilterNegativePosts(conn, "youtube_comments", "published_at");
+                    processTableFilterNeutralPosts(conn, "youtube_comments", "published_at");
+                } catch (SQLException e) {
+                    System.err.println("Error processing x_posts: " + e.getMessage());
+                }
+            });
         } finally {
             executor.shutdown();
             try {
@@ -190,35 +202,57 @@ public class SentimentAnalysis {
         }
     }
 
-    private static void processTable(Connection conn, String tableName) throws SQLException {
-//        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NULL OR sentiment_score > -1";//v2
-//        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NULL OR sentiment_score = 0";
-        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NULL";
-//        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE keyword = 'parasakthi' AND text LIKE '%oast%'";
-        try (Statement stmt = conn.createStatement();
-             ResultSet rs = stmt.executeQuery(sql)) {
+    private static void processTable(Connection conn, String tableName, String timestampColumn) throws SQLException {
+        int batchSize = 100;
+        // Recompute sentiment for every row regardless of prior score, newest timestamp first.
+        // Rows never disappear from the WHERE clause as they're processed, so the offset simply
+        // advances by a full batch each iteration.
+        int offset = 0;
+        while (true) {
+            String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName +
+                    " WHERE text IS NOT NULL AND TRIM(text) <> ''" +
+                    " AND keyword IS NOT NULL AND TRIM(keyword) <> ''" +
+                    " ORDER BY " + timestampColumn + " DESC NULLS LAST" +
+                    " LIMIT " + batchSize + " OFFSET " + offset;
 
-            while (rs.next()) {
-                String id = rs.getString("id");
-                String text = rs.getString("text");
-                String keyword = rs.getString("keyword");
-                String category = rs.getString("sentiment_category");
-
-                if (text != null && !text.trim().isEmpty() && keyword != null && !keyword.trim().isEmpty()) {
-                    try {
-                        SentimentResponse sentimentResponse = getAverageSentimentScore(text, keyword, category);
-                        System.out.println("Updating sentiment score for id (generic): " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
-                        updateSentimentScore(conn, tableName, id, sentimentResponse);
-                    } catch (IOException e) {
-                        System.err.println("Error calling sentiment analysis API for " + tableName + " ID: " + id + ". " + e.getMessage());
-                    }
+            // Buffer the batch into memory and close the ResultSet before issuing updates.
+            java.util.List<String[]> batch = new java.util.ArrayList<>();
+            try (Statement stmt = conn.createStatement();
+                 ResultSet rs = stmt.executeQuery(sql)) {
+                while (rs.next()) {
+                    batch.add(new String[]{
+                            rs.getString("id"),
+                            rs.getString("text"),
+                            rs.getString("keyword"),
+                            rs.getString("sentiment_category")
+                    });
                 }
             }
+
+            if (batch.isEmpty()) {
+                break;
+            }
+
+            for (String[] row : batch) {
+                String id = row[0];
+                String text = row[1];
+                String keyword = row[2];
+                String category = row[3];
+                try {
+                    SentimentResponse sentimentResponse = getAverageSentimentScore(text, keyword, category);
+                    System.out.println("Updating sentiment score for id (generic): " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
+                    updateSentimentScore(conn, tableName, id, sentimentResponse);
+                } catch (IOException e) {
+                    System.err.println("Error calling sentiment analysis API for " + tableName + " ID: " + id + ". " + e.getMessage());
+                }
+            }
+            offset += batchSize;
         }
     }
 
-    private static void processTableFilterInvalidPosts(Connection conn, String tableName) throws SQLException {
-        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NOT NULL AND sentiment_score > 0";//v2
+    private static void processTableFilterInvalidPosts(Connection conn, String tableName, String timestampColumn) throws SQLException {
+        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NOT NULL AND sentiment_score > 0" +
+                " ORDER BY " + timestampColumn + " DESC NULLS LAST";//v2
 //        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE keyword = 'parasakthi' AND text LIKE '%oast%'";
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
@@ -246,8 +280,9 @@ public class SentimentAnalysis {
         }
     }
 
-    private static void processTableFilterPositivePosts(Connection conn, String tableName) throws SQLException {
-        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NOT NULL AND sentiment_score >= 75";//v2
+    private static void processTableFilterPositivePosts(Connection conn, String tableName, String timestampColumn) throws SQLException {
+        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NOT NULL AND sentiment_score >= 75" +
+                " ORDER BY " + timestampColumn + " DESC NULLS LAST";//v2
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
 
@@ -274,8 +309,9 @@ public class SentimentAnalysis {
         }
     }
 
-    private static void processTableFilterNegativePosts(Connection conn, String tableName) throws SQLException {
-        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NOT NULL AND sentiment_score <= 50";//v2
+    private static void processTableFilterNegativePosts(Connection conn, String tableName, String timestampColumn) throws SQLException {
+        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NOT NULL AND sentiment_score <= 50" +
+                " ORDER BY " + timestampColumn + " DESC NULLS LAST";//v2
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
 
@@ -302,8 +338,9 @@ public class SentimentAnalysis {
         }
     }
 
-    private static void processTableFilterNeutralPosts(Connection conn, String tableName) throws SQLException {
-        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NOT NULL AND sentiment_score > 50 AND sentiment_score < 75";//v2
+    private static void processTableFilterNeutralPosts(Connection conn, String tableName, String timestampColumn) throws SQLException {
+        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NOT NULL AND sentiment_score > 50 AND sentiment_score < 75" +
+                " ORDER BY " + timestampColumn + " DESC NULLS LAST";//v2
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
 
@@ -331,8 +368,6 @@ public class SentimentAnalysis {
     }
 
     private static SentimentResponse getAverageSentimentScore(String text, String keyword, String category) throws IOException {
-        int totalScore = 0;
-        int validScoreCount = 0;
         SentimentResponse sentimentResponse = new SentimentResponse();
         HashMap<String, String> prompts = new HashMap<>();
         prompts.put("media.movie", PROMPT_MEDIA_MOVIE_TEMPLATE);
@@ -349,24 +384,7 @@ public class SentimentAnalysis {
         prompts.put("politics.campaign", PROMPT_POLITICS_CAMPAIGN_TEMPLATE);
         prompts.put("politics.party", PROMPT_POLITICS_PARTY_TEMPLATE);
 
-        if (category == null) {
-            if (keyword.equalsIgnoreCase("GDN") || keyword.equalsIgnoreCase("GDNaidu")
-                    || keyword.equalsIgnoreCase("Dhurandhar") || keyword.equalsIgnoreCase("Dhurandhar2")
-                    || keyword.equalsIgnoreCase("GDNTheFilm") || keyword.equalsIgnoreCase("DhurandharTheRevenge")
-                    || keyword.equalsIgnoreCase("tereishqmein") || keyword.equalsIgnoreCase("Parasakthi")
-                    || keyword.equalsIgnoreCase("Assi") || keyword.equalsIgnoreCase("WithLove")
-                    || keyword.equalsIgnoreCase("tereishqmein")) {
-                category = "media.movie";
-            } else if (keyword.equalsIgnoreCase("Madhavan") || keyword.equalsIgnoreCase("Dushara")
-                    || keyword.equalsIgnoreCase("Sathyaraj") || keyword.equalsIgnoreCase("Jayaram")
-                    || keyword.equalsIgnoreCase("DusharaVijayan") || keyword.equalsIgnoreCase("RMadhavan")
-                    || keyword.equalsIgnoreCase("VinayRai") || keyword.equalsIgnoreCase("KrishnakumarRamakumar")
-                    || keyword.equalsIgnoreCase("VijayMoolan") || keyword.equalsIgnoreCase("YogiBabu")) {
-                category = "media.celebrity";
-            } else {
-                category = "politics.party";
-            }
-        } else if (category.equalsIgnoreCase("invalid")) {
+        if ((category == null) || (category.equalsIgnoreCase("invalid"))) {
             category = "media.movie";
         }
 
@@ -377,29 +395,18 @@ public class SentimentAnalysis {
             return sentimentResponse;
         }
 
-        for (int i=0; i<3; i++) {
-            sentimentResponse = callSentimentApi(prompt, text, keyword);
-            int score = (int) Math.round(sentimentResponse.getPositivityScore());
+        sentimentResponse = callSentimentApi(prompt, text, keyword);
+        int score = (int) Math.round(sentimentResponse.getPositivityScore());
 
-            if (score >= 0) {
-                totalScore += score;
-                validScoreCount++;
-            } else {
-                validScoreCount = 0;
-                break;
-            }
-        }
-
-        if (validScoreCount == 0) {
+        if (score < 0) {
             return sentimentResponse;
         }
 
-        SentimentResponse avgSentimentResponse = new SentimentResponse();
-        int score = Math.round((float) totalScore / validScoreCount);
-        avgSentimentResponse.setCategory(category);
-        avgSentimentResponse.setPositivityScore(score);
+        SentimentResponse finalSentimentResponse = new SentimentResponse();
+        finalSentimentResponse.setCategory(category);
+        finalSentimentResponse.setPositivityScore(score);
 
-        return avgSentimentResponse;
+        return finalSentimentResponse;
     }
 
     private static SentimentResponse callSentimentApi(String promptTemplate, String text, String keyword) throws IOException {
@@ -475,11 +482,11 @@ public class SentimentAnalysis {
         }
     }
 
-    private static void updateSentimentScore(Connection conn, String tableName, String id, SentimentResponse sentimentResponse) throws SQLException {
+    private static boolean updateSentimentScore(Connection conn, String tableName, String id, SentimentResponse sentimentResponse) throws SQLException {
         int sentimentScore = (int) Math.round(sentimentResponse.getPositivityScore());
         if (sentimentScore > 100) {
             System.err.println("Skipping update for " + tableName + " ID: " + id + " - LLM returned out-of-range score: " + sentimentScore);
-            return;
+            return false;
         }
         sentimentScore = Math.max(sentimentScore, 0);
         String category = sentimentResponse.getCategory();
@@ -490,6 +497,7 @@ public class SentimentAnalysis {
             pstmt.setString(3, id);
             pstmt.executeUpdate();
         }
+        return true;
     }
 
     private static class PromptRequest {
