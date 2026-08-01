@@ -69,7 +69,7 @@ public class SentimentAnalysis {
     }
 
     public static void main(String[] args) {
-        ExecutorService executor = Executors.newFixedThreadPool(1);
+        ExecutorService executor = Executors.newFixedThreadPool(5);
         try {
             executor.submit(() -> {
                 // Poll continuously: drain both tables, wait, then re-check for rows that
@@ -79,9 +79,9 @@ public class SentimentAnalysis {
                 try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
                     while (!Thread.currentThread().isInterrupted()) {
                         processTable(conn, "x_posts", "created_at");
-//                        processTable(conn, "instagram_posts", "created_at");
+                        processTable(conn, "instagram_posts", "timestamp");
                         processTable(conn, "youtube_comments", "published_at");
-//                        processRedditPosts(conn);
+                        processRedditPosts(conn);
                         try {
                             Thread.sleep(pollIntervalMillis);
                         } catch (InterruptedException e) {
@@ -155,6 +155,26 @@ public class SentimentAnalysis {
                     System.err.println("Error processing x_posts: " + e.getMessage());
                 }
             });
+            executor.submit(() -> {
+                try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
+                    processTableFilterInvalidPosts(conn, "instagram_posts", "timestamp");
+                    processTableFilterPositivePosts(conn, "instagram_posts", "timestamp");
+                    processTableFilterNegativePosts(conn, "instagram_posts", "timestamp");
+                    processTableFilterNeutralPosts(conn, "instagram_posts", "timestamp");
+                } catch (SQLException e) {
+                    System.err.println("Error processing instagram_posts: " + e.getMessage());
+                }
+            });
+            executor.submit(() -> {
+                try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
+                    processRedditPostsFilterInvalidPosts(conn, "created_at");
+                    processRedditPostsFilterPositivePosts(conn, "created_at");
+                    processRedditPostsFilterNegativePosts(conn, "created_at");
+                    processRedditPostsFilterNeutralPosts(conn, "created_at");
+                } catch (SQLException e) {
+                    System.err.println("Error processing reddit_posts: " + e.getMessage());
+                }
+            });
         } finally {
             executor.shutdown();
             try {
@@ -182,18 +202,143 @@ public class SentimentAnalysis {
 
                 if (keyword != null && !keyword.trim().isEmpty()) {
                     try {
-                        SentimentResponse sentimentResponse;
-                        if (text != null && !text.trim().isEmpty()) {
-                            SentimentResponse titleSentiment = getAverageSentimentScore(title, keyword, category);
-                            SentimentResponse textSentiment = getAverageSentimentScore(text, keyword, category);
-                            sentimentResponse = new SentimentResponse();
-                            sentimentResponse.setPositivityScore((titleSentiment.getPositivityScore() + textSentiment.getPositivityScore()) / 2);
-                            sentimentResponse.setCategory(textSentiment.getCategory());
-                        } else {
-                            sentimentResponse = getAverageSentimentScore(title, keyword, category);
-                        }
+                        SentimentResponse sentimentResponse = getRedditSentiment(title, text, keyword, category);
                         System.out.println("Updating sentiment score for id: " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
                         updateSentimentScore(conn, "reddit_posts", id, sentimentResponse);
+                    } catch (IOException e) {
+                        System.err.println("Error calling sentiment analysis API for reddit_posts ID: " + id + ". " + e.getMessage());
+                    }
+                }
+            }
+        }
+    }
+
+    // Reddit posts carry a separate title and body, so score both and average them rather
+    // than scoring a single text column like the other platforms.
+    private static SentimentResponse getRedditSentiment(String title, String text, String keyword, String category) throws IOException {
+        if (text != null && !text.trim().isEmpty()) {
+            SentimentResponse titleSentiment = getAverageSentimentScore(title, keyword, category);
+            SentimentResponse textSentiment = getAverageSentimentScore(text, keyword, category);
+            SentimentResponse combined = new SentimentResponse();
+            combined.setPositivityScore((titleSentiment.getPositivityScore() + textSentiment.getPositivityScore()) / 2);
+            combined.setCategory(textSentiment.getCategory());
+            return combined;
+        }
+        return getAverageSentimentScore(title, keyword, category);
+    }
+
+    private static void processRedditPostsFilterInvalidPosts(Connection conn, String timestampColumn) throws SQLException {
+        String sql = "SELECT id, title, text, keyword, sentiment_category FROM reddit_posts WHERE sentiment_score IS NOT NULL AND sentiment_score > 0" +
+                " ORDER BY " + timestampColumn + " DESC NULLS LAST";
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+
+            while (rs.next()) {
+                String id = rs.getString("id");
+                String title = rs.getString("title");
+                String text = rs.getString("text");
+                String keyword = rs.getString("keyword");
+                String category = rs.getString("sentiment_category");
+
+                if (keyword != null && !keyword.trim().isEmpty()) {
+                    try {
+                        String tempCategory = category + ".invalid";
+                        SentimentResponse sentimentResponse = getRedditSentiment(title, text, keyword, tempCategory);
+                        System.out.println("Updating sentiment score for id (invalid posts): " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
+                        if (sentimentResponse.getPositivityScore() <= 0) {
+                            sentimentResponse.setCategory(category);
+                            updateSentimentScore(conn, "reddit_posts", id, sentimentResponse);
+                        }
+                    } catch (IOException e) {
+                        System.err.println("Error calling sentiment analysis API for reddit_posts ID: " + id + ". " + e.getMessage());
+                    }
+                }
+            }
+        }
+    }
+
+    private static void processRedditPostsFilterPositivePosts(Connection conn, String timestampColumn) throws SQLException {
+        String sql = "SELECT id, title, text, keyword, sentiment_category FROM reddit_posts WHERE sentiment_score IS NOT NULL AND sentiment_score >= 75" +
+                " ORDER BY " + timestampColumn + " DESC NULLS LAST";
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+
+            while (rs.next()) {
+                String id = rs.getString("id");
+                String title = rs.getString("title");
+                String text = rs.getString("text");
+                String keyword = rs.getString("keyword");
+                String category = rs.getString("sentiment_category");
+
+                if (keyword != null && !keyword.trim().isEmpty()) {
+                    try {
+                        String tempCategory = category + ".positive";
+                        SentimentResponse sentimentResponse = getRedditSentiment(title, text, keyword, tempCategory);
+                        System.out.println("Updating sentiment score for id (positive posts): " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
+                        if (sentimentResponse.getPositivityScore() >= 75) {
+                            sentimentResponse.setCategory(category);
+                            updateSentimentScore(conn, "reddit_posts", id, sentimentResponse);
+                        }
+                    } catch (IOException e) {
+                        System.err.println("Error calling sentiment analysis API for reddit_posts ID: " + id + ". " + e.getMessage());
+                    }
+                }
+            }
+        }
+    }
+
+    private static void processRedditPostsFilterNegativePosts(Connection conn, String timestampColumn) throws SQLException {
+        String sql = "SELECT id, title, text, keyword, sentiment_category FROM reddit_posts WHERE sentiment_score IS NOT NULL AND sentiment_score <= 50" +
+                " ORDER BY " + timestampColumn + " DESC NULLS LAST";
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+
+            while (rs.next()) {
+                String id = rs.getString("id");
+                String title = rs.getString("title");
+                String text = rs.getString("text");
+                String keyword = rs.getString("keyword");
+                String category = rs.getString("sentiment_category");
+
+                if (keyword != null && !keyword.trim().isEmpty()) {
+                    try {
+                        String tempCategory = category + ".negative";
+                        SentimentResponse sentimentResponse = getRedditSentiment(title, text, keyword, tempCategory);
+                        System.out.println("Updating sentiment score for id (negative posts): " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
+                        if (sentimentResponse.getPositivityScore() <= 50) {
+                            sentimentResponse.setCategory(category);
+                            updateSentimentScore(conn, "reddit_posts", id, sentimentResponse);
+                        }
+                    } catch (IOException e) {
+                        System.err.println("Error calling sentiment analysis API for reddit_posts ID: " + id + ". " + e.getMessage());
+                    }
+                }
+            }
+        }
+    }
+
+    private static void processRedditPostsFilterNeutralPosts(Connection conn, String timestampColumn) throws SQLException {
+        String sql = "SELECT id, title, text, keyword, sentiment_category FROM reddit_posts WHERE sentiment_score IS NOT NULL AND sentiment_score > 50 AND sentiment_score < 75" +
+                " ORDER BY " + timestampColumn + " DESC NULLS LAST";
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+
+            while (rs.next()) {
+                String id = rs.getString("id");
+                String title = rs.getString("title");
+                String text = rs.getString("text");
+                String keyword = rs.getString("keyword");
+                String category = rs.getString("sentiment_category");
+
+                if (keyword != null && !keyword.trim().isEmpty()) {
+                    try {
+                        String tempCategory = category + ".neutral";
+                        SentimentResponse sentimentResponse = getRedditSentiment(title, text, keyword, tempCategory);
+                        System.out.println("Updating sentiment score for id (neutral posts): " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
+                        if (sentimentResponse.getPositivityScore() > 50 && sentimentResponse.getPositivityScore() < 75) {
+                            sentimentResponse.setCategory(category);
+                            updateSentimentScore(conn, "reddit_posts", id, sentimentResponse);
+                        }
                     } catch (IOException e) {
                         System.err.println("Error calling sentiment analysis API for reddit_posts ID: " + id + ". " + e.getMessage());
                     }
