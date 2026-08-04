@@ -78,6 +78,7 @@ public class SentimentAnalysis {
                 long pollIntervalMillis = TimeUnit.MINUTES.toMillis(5);
                 try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
                     while (!Thread.currentThread().isInterrupted()) {
+                        markRetweets(conn);
                         processTable(conn, "x_posts", "created_at");
                         processTable(conn, "instagram_posts", "timestamp");
                         processTable(conn, "youtube_comments", "published_at");
@@ -188,6 +189,18 @@ public class SentimentAnalysis {
         }
     }
 
+    // Retweets carry a deterministic "RT @user: " prefix in the raw text, so this is checked
+    // directly in SQL rather than burning an LLM call on it.
+    private static void markRetweets(Connection conn) throws SQLException {
+        String sql = "UPDATE x_posts SET is_retweet = true WHERE text LIKE 'RT @%' AND is_retweet = false";
+        try (Statement stmt = conn.createStatement()) {
+            int updated = stmt.executeUpdate(sql);
+            if (updated > 0) {
+                System.out.println("Marked " + updated + " x_posts rows as retweets");
+            }
+        }
+    }
+
     private static void processRedditPosts(Connection conn) throws SQLException {
         String sql = "SELECT id, title, text, keyword, sentiment_category FROM reddit_posts WHERE sentiment_score IS NULL OR sentiment_score = 0";
         try (Statement stmt = conn.createStatement();
@@ -222,9 +235,19 @@ public class SentimentAnalysis {
             SentimentResponse combined = new SentimentResponse();
             combined.setPositivityScore((titleSentiment.getPositivityScore() + textSentiment.getPositivityScore()) / 2);
             combined.setCategory(textSentiment.getCategory());
+            combined.setIsPromotional(combinePromotional(titleSentiment.getIsPromotional(), textSentiment.getIsPromotional()));
             return combined;
         }
         return getAverageSentimentScore(title, keyword, category);
+    }
+
+    // Either half being promotional (e.g. a promotional title with a neutral body, or vice
+    // versa) is enough to mark the whole Reddit post as promotional.
+    private static Boolean combinePromotional(Boolean a, Boolean b) {
+        if (a == null && b == null) {
+            return null;
+        }
+        return Boolean.TRUE.equals(a) || Boolean.TRUE.equals(b);
     }
 
     private static void processRedditPostsFilterInvalidPosts(Connection conn, String timestampColumn) throws SQLException {
@@ -550,6 +573,7 @@ public class SentimentAnalysis {
         SentimentResponse finalSentimentResponse = new SentimentResponse();
         finalSentimentResponse.setCategory(category);
         finalSentimentResponse.setPositivityScore(score);
+        finalSentimentResponse.setIsPromotional(sentimentResponse.getIsPromotional());
 
         return finalSentimentResponse;
     }
@@ -635,11 +659,18 @@ public class SentimentAnalysis {
         }
         sentimentScore = Math.max(sentimentScore, 0);
         String category = sentimentResponse.getCategory();
-        String sql = "UPDATE " + tableName + " SET sentiment_score = ?, sentiment_category = ? WHERE id = ?";
+        Boolean isPromotional = sentimentResponse.getIsPromotional();
+        String sql = "UPDATE " + tableName + " SET sentiment_score = ?, sentiment_category = ?" +
+                (isPromotional != null ? ", is_promotional = ?" : "") +
+                " WHERE id = ?";
         try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
-            pstmt.setInt(1, sentimentScore);
-            pstmt.setString(2, category);
-            pstmt.setString(3, id);
+            int idx = 1;
+            pstmt.setInt(idx++, sentimentScore);
+            pstmt.setString(idx++, category);
+            if (isPromotional != null) {
+                pstmt.setBoolean(idx++, isPromotional);
+            }
+            pstmt.setString(idx, id);
             pstmt.executeUpdate();
         }
         return true;
@@ -660,6 +691,10 @@ public class SentimentAnalysis {
     private static class SentimentResponse {
         private String category;
         private double positivity_score;
+        // Null means the prompt used for this call doesn't classify promotional content, so
+        // updateSentimentScore leaves any previously-stored value untouched instead of
+        // overwriting it with a default.
+        private Boolean is_promotional;
 
         SentimentResponse() {
             this.category = "invalid";
@@ -674,12 +709,20 @@ public class SentimentAnalysis {
             return category;
         }
 
+        public Boolean getIsPromotional() {
+            return is_promotional;
+        }
+
         public void setCategory(String category) {
             this.category = category;
         }
 
         public void setPositivityScore(double positivityScore) {
             this.positivity_score = positivityScore;
+        }
+
+        public void setIsPromotional(Boolean isPromotional) {
+            this.is_promotional = isPromotional;
         }
     }
 }
