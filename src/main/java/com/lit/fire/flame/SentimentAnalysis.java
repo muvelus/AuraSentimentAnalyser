@@ -2,6 +2,7 @@ package com.lit.fire.flame;
 
 import com.google.gson.Gson;
 import com.google.gson.JsonSyntaxException;
+import org.apache.http.client.config.RequestConfig;
 import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpPost;
 import org.apache.http.entity.StringEntity;
@@ -20,6 +21,15 @@ import java.util.concurrent.TimeUnit;
 
 public class SentimentAnalysis {
 
+    // Without an explicit timeout, a request the LLM server accepts but never responds to (e.g.
+    // mid-crash or overloaded) blocks the calling thread forever - connectTimeout covers the TCP
+    // handshake, socketTimeout covers waiting on a stalled response so callers fall through to the
+    // existing 30s-sleep retry loop instead of hanging indefinitely.
+    private static final RequestConfig HTTP_REQUEST_CONFIG = RequestConfig.custom()
+            .setConnectTimeout(15000)
+            .setSocketTimeout(120000)
+            .build();
+
     private static final String DB_URL;
     private static final String USER;
     private static final String PASS;
@@ -37,6 +47,7 @@ public class SentimentAnalysis {
     private static final String PROMPT_POLITICS_POLITICIAN_TEMPLATE;
     private static final String PROMPT_POLITICS_CAMPAIGN_TEMPLATE;
     private static final String PROMPT_POLITICS_PARTY_TEMPLATE;
+    private static final String PROMPT_CLASSIFICATION_MOVIE_TEMPLATE;
 
     static {
         Properties props = new Properties();
@@ -63,6 +74,7 @@ public class SentimentAnalysis {
             PROMPT_POLITICS_POLITICIAN_TEMPLATE = props.getProperty("prompt.politics.politician");
             PROMPT_POLITICS_CAMPAIGN_TEMPLATE = props.getProperty("prompt.politics.campaign");
             PROMPT_POLITICS_PARTY_TEMPLATE = props.getProperty("prompt.politics.party");
+            PROMPT_CLASSIFICATION_MOVIE_TEMPLATE = props.getProperty("prompt.classification.movie");
         } catch (IOException ex) {
             throw new RuntimeException("Error loading application.properties", ex);
         }
@@ -80,9 +92,13 @@ public class SentimentAnalysis {
                     while (!Thread.currentThread().isInterrupted()) {
                         markRetweets(conn);
                         processTable(conn, "x_posts", "created_at");
+                        processClassification(conn, "x_posts", "created_at");
                         processTable(conn, "instagram_posts", "timestamp");
+                        processClassification(conn, "instagram_posts", "timestamp");
                         processTable(conn, "youtube_comments", "published_at");
+                        processClassification(conn, "youtube_comments", "published_at");
                         processRedditPosts(conn);
+                        processClassificationReddit(conn, "created_at");
                         try {
                             Thread.sleep(pollIntervalMillis);
                         } catch (InterruptedException e) {
@@ -418,6 +434,139 @@ public class SentimentAnalysis {
         }
     }
 
+    // Classification (author_type/content_intent/predicted_region/topic_category) is only defined
+    // for media.movie today, and unlike sentiment it doesn't need periodic recomputation, so this
+    // only processes rows that haven't been classified yet.
+    private static void processClassification(Connection conn, String tableName, String timestampColumn) throws SQLException {
+        String sql = "SELECT id, text, keyword, author FROM " + tableName +
+                " WHERE text IS NOT NULL AND TRIM(text) <> ''" +
+                " AND keyword IS NOT NULL AND TRIM(keyword) <> ''" +
+                " AND sentiment_category = 'media.movie'" +
+                " AND author_type IS NULL" +
+                " ORDER BY " + timestampColumn + " DESC NULLS LAST";
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+
+            while (rs.next()) {
+                String id = rs.getString("id");
+                String text = rs.getString("text");
+                String keyword = rs.getString("keyword");
+                String author = rs.getString("author");
+
+                try {
+                    ClassificationResponse classificationResponse = getContentClassification(text, keyword, author);
+                    System.out.println("Updating classification for id: " + id + ", author_type: " + classificationResponse.getAuthorType());
+                    updateClassification(conn, tableName, id, classificationResponse);
+                } catch (IOException e) {
+                    System.err.println("Error calling classification API for " + tableName + " ID: " + id + ". " + e.getMessage());
+                }
+            }
+        }
+    }
+
+    private static void processClassificationReddit(Connection conn, String timestampColumn) throws SQLException {
+        String sql = "SELECT id, title, text, keyword, author FROM reddit_posts" +
+                " WHERE keyword IS NOT NULL AND TRIM(keyword) <> ''" +
+                " AND sentiment_category = 'media.movie'" +
+                " AND author_type IS NULL" +
+                " ORDER BY " + timestampColumn + " DESC NULLS LAST";
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+
+            while (rs.next()) {
+                String id = rs.getString("id");
+                String title = rs.getString("title");
+                String text = rs.getString("text");
+                String keyword = rs.getString("keyword");
+                String author = rs.getString("author");
+                String combinedText = (text != null && !text.trim().isEmpty()) ? title + "\n" + text : title;
+
+                try {
+                    ClassificationResponse classificationResponse = getContentClassification(combinedText, keyword, author);
+                    System.out.println("Updating classification for reddit_posts id: " + id + ", author_type: " + classificationResponse.getAuthorType());
+                    updateClassification(conn, "reddit_posts", id, classificationResponse);
+                } catch (IOException e) {
+                    System.err.println("Error calling classification API for reddit_posts ID: " + id + ". " + e.getMessage());
+                }
+            }
+        }
+    }
+
+    private static ClassificationResponse getContentClassification(String text, String keyword, String author) throws IOException {
+        return callClassificationApi(PROMPT_CLASSIFICATION_MOVIE_TEMPLATE, text, keyword, author);
+    }
+
+    private static ClassificationResponse callClassificationApi(String promptTemplate, String text, String keyword, String author) throws IOException {
+        int maxRetries = 20;
+        int retryCount = 0;
+        while (true) {
+            try (CloseableHttpClient httpClient = HttpClients.custom().setDefaultRequestConfig(HTTP_REQUEST_CONFIG).build()) {
+                HttpPost httpPost = new HttpPost(LLM_URL);
+                Gson gson = new Gson();
+
+                if (promptTemplate == null) {
+                    System.err.println("Classification prompt template is null for keyword: " + keyword);
+                    return new ClassificationResponse();
+                }
+
+                String promptString = promptTemplate.replace("{keyword}", keyword)
+                        .replace("{text}", text)
+                        .replace("{author}", author != null ? author : "");
+                PromptRequest payload = new PromptRequest(promptString);
+                String jsonPayload = gson.toJson(payload);
+
+                StringEntity entity = new StringEntity(jsonPayload, "UTF-8");
+                httpPost.setEntity(entity);
+                httpPost.setHeader("Accept", "application/json");
+                httpPost.setHeader("Content-type", "application/json; charset=UTF-8");
+
+                try (CloseableHttpResponse response = httpClient.execute(httpPost)) {
+                    String responseString = EntityUtils.toString(response.getEntity());
+                    System.out.println("Raw classification response from LLM: " + responseString);
+                    int firstBrace = responseString.indexOf('{');
+                    int lastBrace = responseString.lastIndexOf('}');
+
+                    if (firstBrace == -1 || lastBrace == -1 || lastBrace <= firstBrace) {
+                        System.err.println("Could not find a valid JSON object in the classification response.");
+                        return new ClassificationResponse();
+                    }
+
+                    String jsonResponse = responseString.substring(firstBrace, lastBrace + 1);
+                    try {
+                        ClassificationResponse classificationResponse = gson.fromJson(jsonResponse, ClassificationResponse.class);
+                        return classificationResponse != null ? classificationResponse : new ClassificationResponse();
+                    } catch (JsonSyntaxException e) {
+                        System.err.println("Failed to parse extracted classification JSON: " + jsonResponse);
+                        return new ClassificationResponse();
+                    }
+                }
+            } catch (IOException e) {
+                if (++retryCount >= maxRetries) {
+                    throw e;
+                }
+                System.err.println("LLM service is not reachable. Retrying in 30 seconds...");
+                try {
+                    Thread.sleep(30000);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted while waiting to retry", ie);
+                }
+            }
+        }
+    }
+
+    private static void updateClassification(Connection conn, String tableName, String id, ClassificationResponse response) throws SQLException {
+        String sql = "UPDATE " + tableName + " SET author_type = ?, content_intent = ?, predicted_region = ?, topic_category = ? WHERE id = ?";
+        try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setString(1, response.getAuthorType());
+            pstmt.setString(2, response.getContentIntent());
+            pstmt.setString(3, response.getPredictedRegion());
+            pstmt.setString(4, response.getTopicCategory());
+            pstmt.setString(5, id);
+            pstmt.executeUpdate();
+        }
+    }
+
     private static void processTableFilterInvalidPosts(Connection conn, String tableName, String timestampColumn) throws SQLException {
         String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NOT NULL AND sentiment_score > 0" +
                 " ORDER BY " + timestampColumn + " DESC NULLS LAST";//v2
@@ -582,7 +731,7 @@ public class SentimentAnalysis {
         int maxRetries = 20;
         int retryCount = 0;
         while (true) {
-            try (CloseableHttpClient httpClient = HttpClients.createDefault()) {
+            try (CloseableHttpClient httpClient = HttpClients.custom().setDefaultRequestConfig(HTTP_REQUEST_CONFIG).build()) {
                 HttpPost httpPost = new HttpPost(LLM_URL);
                 Gson gson = new Gson();
 
@@ -723,6 +872,29 @@ public class SentimentAnalysis {
 
         public void setIsPromotional(Boolean isPromotional) {
             this.is_promotional = isPromotional;
+        }
+    }
+
+    private static class ClassificationResponse {
+        private String author_type;
+        private String content_intent;
+        private String predicted_region;
+        private String topic_category;
+
+        public String getAuthorType() {
+            return author_type;
+        }
+
+        public String getContentIntent() {
+            return content_intent;
+        }
+
+        public String getPredictedRegion() {
+            return predicted_region;
+        }
+
+        public String getTopicCategory() {
+            return topic_category;
         }
     }
 }
