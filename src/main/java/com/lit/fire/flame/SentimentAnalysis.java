@@ -387,50 +387,42 @@ public class SentimentAnalysis {
     }
 
     private static void processTable(Connection conn, String tableName, String timestampColumn) throws SQLException {
-        int batchSize = 100;
-        // Recompute sentiment for every row regardless of prior score, newest timestamp first.
-        // Rows never disappear from the WHERE clause as they're processed, so the offset simply
-        // advances by a full batch each iteration.
-        int offset = 0;
-        while (true) {
-            String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName +
-                    " WHERE text IS NOT NULL AND TRIM(text) <> ''" +
-                    " AND keyword IS NOT NULL AND TRIM(keyword) <> ''" +
-                    " ORDER BY " + timestampColumn + " DESC NULLS LAST" +
-                    " LIMIT " + batchSize + " OFFSET " + offset;
+        // Only score rows that haven't been scored yet, newest timestamp first. Matches
+        // processRedditPosts: a single pass over everything currently unscored, rather than
+        // paginating - a row that keeps failing to score (e.g. an out-of-range LLM response)
+        // would otherwise stay in the WHERE clause forever and make an OFFSET-based loop spin.
+        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName +
+                " WHERE text IS NOT NULL AND TRIM(text) <> ''" +
+                " AND keyword IS NOT NULL AND TRIM(keyword) <> ''" +
+                " AND (sentiment_score IS NULL OR sentiment_score = 0)" +
+                " ORDER BY " + timestampColumn + " DESC NULLS LAST";
 
-            // Buffer the batch into memory and close the ResultSet before issuing updates.
-            java.util.List<String[]> batch = new java.util.ArrayList<>();
-            try (Statement stmt = conn.createStatement();
-                 ResultSet rs = stmt.executeQuery(sql)) {
-                while (rs.next()) {
-                    batch.add(new String[]{
-                            rs.getString("id"),
-                            rs.getString("text"),
-                            rs.getString("keyword"),
-                            rs.getString("sentiment_category")
-                    });
-                }
+        // Buffer into memory and close the ResultSet before issuing updates.
+        java.util.List<String[]> batch = new java.util.ArrayList<>();
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            while (rs.next()) {
+                batch.add(new String[]{
+                        rs.getString("id"),
+                        rs.getString("text"),
+                        rs.getString("keyword"),
+                        rs.getString("sentiment_category")
+                });
             }
+        }
 
-            if (batch.isEmpty()) {
-                break;
+        for (String[] row : batch) {
+            String id = row[0];
+            String text = row[1];
+            String keyword = row[2];
+            String category = row[3];
+            try {
+                SentimentResponse sentimentResponse = getAverageSentimentScore(text, keyword, category);
+                System.out.println("Updating sentiment score for id (generic): " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
+                updateSentimentScore(conn, tableName, id, sentimentResponse);
+            } catch (IOException e) {
+                System.err.println("Error calling sentiment analysis API for " + tableName + " ID: " + id + ". " + e.getMessage());
             }
-
-            for (String[] row : batch) {
-                String id = row[0];
-                String text = row[1];
-                String keyword = row[2];
-                String category = row[3];
-                try {
-                    SentimentResponse sentimentResponse = getAverageSentimentScore(text, keyword, category);
-                    System.out.println("Updating sentiment score for id (generic): " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
-                    updateSentimentScore(conn, tableName, id, sentimentResponse);
-                } catch (IOException e) {
-                    System.err.println("Error calling sentiment analysis API for " + tableName + " ID: " + id + ". " + e.getMessage());
-                }
-            }
-            offset += batchSize;
         }
     }
 
