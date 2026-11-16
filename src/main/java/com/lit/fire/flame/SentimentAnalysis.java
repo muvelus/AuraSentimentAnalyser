@@ -80,6 +80,10 @@ public class SentimentAnalysis {
         }
     }
 
+    // Max rows each sentiment/classification step handles per loop pass, so every step and table
+    // gets a turn every pass instead of one step draining a huge backlog first.
+    private static final int PASS_LIMIT = 200;
+
     public static void main(String[] args) {
         ExecutorService executor = Executors.newFixedThreadPool(5);
         try {
@@ -95,8 +99,8 @@ public class SentimentAnalysis {
                         processClassification(conn, "x_posts", "created_at");
                         processTable(conn, "instagram_posts", "timestamp");
                         processClassification(conn, "instagram_posts", "timestamp");
-                        processTable(conn, "youtube_comments", "published_at");
-                        processClassification(conn, "youtube_comments", "published_at");
+                        processTableYoutube(conn, "published_at");
+                        processClassificationYoutube(conn, "published_at");
                         processRedditPosts(conn);
                         processClassificationReddit(conn, "created_at");
                         try {
@@ -395,7 +399,9 @@ public class SentimentAnalysis {
                 " WHERE text IS NOT NULL AND TRIM(text) <> ''" +
                 " AND keyword IS NOT NULL AND TRIM(keyword) <> ''" +
                 " AND (sentiment_score IS NULL OR sentiment_score = 0)" +
-                " ORDER BY " + timestampColumn + " DESC NULLS LAST";
+                // Never-scored rows first, and a capped pass: the ~67k rows already scored 0 would
+                // otherwise be re-scored every pass (days at LLM speed), starving classification.
+                " ORDER BY (sentiment_score IS NULL) DESC, " + timestampColumn + " DESC NULLS LAST LIMIT " + PASS_LIMIT;
 
         // Buffer into memory and close the ResultSet before issuing updates.
         java.util.List<String[]> batch = new java.util.ArrayList<>();
@@ -426,6 +432,82 @@ public class SentimentAnalysis {
         }
     }
 
+    // YouTube comments are replies to a video, not self-contained posts - a short reaction like
+    // "Super" or "can't wait!" has no keyword or cinematic anchor of its own, so scoring/classifying
+    // the comment text alone starves the LLM of the context it needs to tell a genuine fan reaction
+    // apart from an unrelated comment that happened to be scraped under this keyword. Prefixing the
+    // video title (mirrors how reddit's title+text combination gives the LLM the same kind of anchor).
+    private static void processTableYoutube(Connection conn, String timestampColumn) throws SQLException {
+        String sql = "SELECT id, text, video_title, keyword, sentiment_category FROM youtube_comments" +
+                " WHERE text IS NOT NULL AND TRIM(text) <> ''" +
+                " AND keyword IS NOT NULL AND TRIM(keyword) <> ''" +
+                " AND (sentiment_score IS NULL OR sentiment_score = 0)" +
+                // Never-scored rows first, and a capped pass: the ~67k rows already scored 0 would
+                // otherwise be re-scored every pass (days at LLM speed), starving classification.
+                " ORDER BY (sentiment_score IS NULL) DESC, " + timestampColumn + " DESC NULLS LAST LIMIT " + PASS_LIMIT;
+
+        java.util.List<String[]> batch = new java.util.ArrayList<>();
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            while (rs.next()) {
+                batch.add(new String[]{
+                        rs.getString("id"),
+                        rs.getString("text"),
+                        rs.getString("video_title"),
+                        rs.getString("keyword"),
+                        rs.getString("sentiment_category")
+                });
+            }
+        }
+
+        for (String[] row : batch) {
+            String id = row[0];
+            String text = row[1];
+            String videoTitle = row[2];
+            String keyword = row[3];
+            String category = row[4];
+            String combinedText = (videoTitle != null && !videoTitle.trim().isEmpty()) ? videoTitle + "\n" + text : text;
+            try {
+                SentimentResponse sentimentResponse = getAverageSentimentScore(combinedText, keyword, category);
+                System.out.println("Updating sentiment score for youtube_comments id: " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
+                updateSentimentScore(conn, "youtube_comments", id, sentimentResponse);
+            } catch (IOException e) {
+                System.err.println("Error calling sentiment analysis API for youtube_comments ID: " + id + ". " + e.getMessage());
+            }
+        }
+    }
+
+    private static void processClassificationYoutube(Connection conn, String timestampColumn) throws SQLException {
+        String sql = "SELECT id, text, video_title, keyword, author FROM youtube_comments" +
+                " WHERE text IS NOT NULL AND TRIM(text) <> ''" +
+                " AND keyword IS NOT NULL AND TRIM(keyword) <> ''" +
+                " AND sentiment_category = 'media.movie'" +
+                " AND author_type IS NULL" +
+                // Only relevant rows (score > 0) reach mentions; capped so the loop keeps cycling.
+                " AND sentiment_score > 0" +
+                " ORDER BY " + timestampColumn + " DESC NULLS LAST LIMIT " + PASS_LIMIT;
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+
+            while (rs.next()) {
+                String id = rs.getString("id");
+                String text = rs.getString("text");
+                String videoTitle = rs.getString("video_title");
+                String keyword = rs.getString("keyword");
+                String author = rs.getString("author");
+                String combinedText = (videoTitle != null && !videoTitle.trim().isEmpty()) ? videoTitle + "\n" + text : text;
+
+                try {
+                    ClassificationResponse classificationResponse = getContentClassification(combinedText, keyword, author);
+                    System.out.println("Updating classification for youtube_comments id: " + id + ", author_type: " + classificationResponse.getAuthorType());
+                    updateClassification(conn, "youtube_comments", id, classificationResponse);
+                } catch (IOException e) {
+                    System.err.println("Error calling classification API for youtube_comments ID: " + id + ". " + e.getMessage());
+                }
+            }
+        }
+    }
+
     // Classification (author_type/content_intent/predicted_region/topic_category) is only defined
     // for media.movie today, and unlike sentiment it doesn't need periodic recomputation, so this
     // only processes rows that haven't been classified yet.
@@ -435,7 +517,9 @@ public class SentimentAnalysis {
                 " AND keyword IS NOT NULL AND TRIM(keyword) <> ''" +
                 " AND sentiment_category = 'media.movie'" +
                 " AND author_type IS NULL" +
-                " ORDER BY " + timestampColumn + " DESC NULLS LAST";
+                // Only relevant rows (score > 0) reach mentions; capped so the loop keeps cycling.
+                " AND sentiment_score > 0" +
+                " ORDER BY " + timestampColumn + " DESC NULLS LAST LIMIT " + PASS_LIMIT;
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
 
@@ -461,7 +545,9 @@ public class SentimentAnalysis {
                 " WHERE keyword IS NOT NULL AND TRIM(keyword) <> ''" +
                 " AND sentiment_category = 'media.movie'" +
                 " AND author_type IS NULL" +
-                " ORDER BY " + timestampColumn + " DESC NULLS LAST";
+                // Only relevant rows (score > 0) reach mentions; capped so the loop keeps cycling.
+                " AND sentiment_score > 0" +
+                " ORDER BY " + timestampColumn + " DESC NULLS LAST LIMIT " + PASS_LIMIT;
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
 
