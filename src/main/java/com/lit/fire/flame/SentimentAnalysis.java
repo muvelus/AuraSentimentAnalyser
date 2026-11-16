@@ -84,7 +84,28 @@ public class SentimentAnalysis {
     // gets a turn every pass instead of one step draining a huge backlog first.
     private static final int PASS_LIMIT = 200;
 
+    // Each sentiment prompt (the initial category prompt, then the .invalid/.positive/.negative/
+    // .neutral refinement prompts) is applied to a row at most once. The names of the prompts that
+    // have already run are recorded in the row's sentiment_passes array, and every pass skips rows
+    // that already carry its name - so restarting the service doesn't re-run the LLM over rows it
+    // has already scored. Clearing sentiment_passes (e.g. to '{}') re-queues a row for every pass.
+    private static final String PASS_INITIAL = "initial";
+    private static final String PASS_INVALID = "invalid";
+    private static final String PASS_POSITIVE = "positive";
+    private static final String PASS_NEGATIVE = "negative";
+    private static final String PASS_NEUTRAL = "neutral";
+    private static final String[] SENTIMENT_TABLES = {"x_posts", "instagram_posts", "youtube_comments", "reddit_posts"};
+
     public static void main(String[] args) {
+        // Must finish before any pass starts, since every pass query filters on sentiment_passes.
+        try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
+            for (String table : SENTIMENT_TABLES) {
+                ensureSentimentPassesColumn(conn, table);
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to set up sentiment_passes tracking column", e);
+        }
+
         ExecutorService executor = Executors.newFixedThreadPool(5);
         try {
             executor.submit(() -> {
@@ -209,6 +230,52 @@ public class SentimentAnalysis {
         }
     }
 
+    // Adds the sentiment_passes column the first time the service runs against a table. Rows that
+    // already have a sentiment_score were scored by the initial prompt before tracking existed, so
+    // they're backfilled as having had that pass; nothing is known about which refinement prompts
+    // already ran on them, so those each run once more and are then recorded.
+    private static void ensureSentimentPassesColumn(Connection conn, String tableName) throws SQLException {
+        String existsSql = "SELECT 1 FROM information_schema.columns" +
+                " WHERE table_schema = current_schema() AND table_name = ? AND column_name = 'sentiment_passes'";
+        try (PreparedStatement pstmt = conn.prepareStatement(existsSql)) {
+            pstmt.setString(1, tableName);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                if (rs.next()) {
+                    return;
+                }
+            }
+        }
+
+        boolean autoCommit = conn.getAutoCommit();
+        conn.setAutoCommit(false);
+        try (Statement stmt = conn.createStatement()) {
+            stmt.executeUpdate("ALTER TABLE " + tableName + " ADD COLUMN sentiment_passes TEXT[] NOT NULL DEFAULT '{}'");
+            int backfilled = stmt.executeUpdate("UPDATE " + tableName + " SET sentiment_passes = ARRAY['" + PASS_INITIAL + "']" +
+                    " WHERE sentiment_score IS NOT NULL");
+            conn.commit();
+            System.out.println("Added sentiment_passes to " + tableName + "; marked " + backfilled + " already-scored rows as initial-pass done");
+        } catch (SQLException e) {
+            conn.rollback();
+            throw e;
+        } finally {
+            conn.setAutoCommit(autoCommit);
+        }
+    }
+
+    // Called once a prompt has produced a result for the row (whether or not that result changed the
+    // stored score), so the same prompt is never run on the row again. Not called when the LLM call
+    // itself failed (IOException), so those rows are retried on a later pass.
+    private static void markPassDone(Connection conn, String tableName, String id, String pass) throws SQLException {
+        String sql = "UPDATE " + tableName + " SET sentiment_passes = array_append(sentiment_passes, ?)" +
+                " WHERE id = ? AND NOT (? = ANY(sentiment_passes))";
+        try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setString(1, pass);
+            pstmt.setString(2, id);
+            pstmt.setString(3, pass);
+            pstmt.executeUpdate();
+        }
+    }
+
     // Retweets carry a deterministic "RT @user: " prefix in the raw text, so this is checked
     // directly in SQL rather than burning an LLM call on it.
     private static void markRetweets(Connection conn) throws SQLException {
@@ -222,7 +289,9 @@ public class SentimentAnalysis {
     }
 
     private static void processRedditPosts(Connection conn) throws SQLException {
-        String sql = "SELECT id, title, text, keyword, sentiment_category FROM reddit_posts WHERE sentiment_score IS NULL OR sentiment_score = 0";
+        String sql = "SELECT id, title, text, keyword, sentiment_category FROM reddit_posts" +
+                " WHERE keyword IS NOT NULL AND TRIM(keyword) <> ''" +
+                " AND NOT ('" + PASS_INITIAL + "' = ANY(sentiment_passes))";
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
 
@@ -238,6 +307,7 @@ public class SentimentAnalysis {
                         SentimentResponse sentimentResponse = getRedditSentiment(title, text, keyword, category);
                         System.out.println("Updating sentiment score for id: " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
                         updateSentimentScore(conn, "reddit_posts", id, sentimentResponse);
+                        markPassDone(conn, "reddit_posts", id, PASS_INITIAL);
                     } catch (IOException e) {
                         System.err.println("Error calling sentiment analysis API for reddit_posts ID: " + id + ". " + e.getMessage());
                     }
@@ -272,6 +342,7 @@ public class SentimentAnalysis {
 
     private static void processRedditPostsFilterInvalidPosts(Connection conn, String timestampColumn) throws SQLException {
         String sql = "SELECT id, title, text, keyword, sentiment_category FROM reddit_posts WHERE sentiment_score IS NOT NULL AND sentiment_score > 0" +
+                " AND NOT ('" + PASS_INVALID + "' = ANY(sentiment_passes))" +
                 " ORDER BY " + timestampColumn + " DESC NULLS LAST";
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
@@ -292,6 +363,7 @@ public class SentimentAnalysis {
                             sentimentResponse.setCategory(category);
                             updateSentimentScore(conn, "reddit_posts", id, sentimentResponse);
                         }
+                        markPassDone(conn, "reddit_posts", id, PASS_INVALID);
                     } catch (IOException e) {
                         System.err.println("Error calling sentiment analysis API for reddit_posts ID: " + id + ". " + e.getMessage());
                     }
@@ -302,6 +374,7 @@ public class SentimentAnalysis {
 
     private static void processRedditPostsFilterPositivePosts(Connection conn, String timestampColumn) throws SQLException {
         String sql = "SELECT id, title, text, keyword, sentiment_category FROM reddit_posts WHERE sentiment_score IS NOT NULL AND sentiment_score >= 75" +
+                " AND NOT ('" + PASS_POSITIVE + "' = ANY(sentiment_passes))" +
                 " ORDER BY " + timestampColumn + " DESC NULLS LAST";
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
@@ -322,6 +395,7 @@ public class SentimentAnalysis {
                             sentimentResponse.setCategory(category);
                             updateSentimentScore(conn, "reddit_posts", id, sentimentResponse);
                         }
+                        markPassDone(conn, "reddit_posts", id, PASS_POSITIVE);
                     } catch (IOException e) {
                         System.err.println("Error calling sentiment analysis API for reddit_posts ID: " + id + ". " + e.getMessage());
                     }
@@ -332,6 +406,7 @@ public class SentimentAnalysis {
 
     private static void processRedditPostsFilterNegativePosts(Connection conn, String timestampColumn) throws SQLException {
         String sql = "SELECT id, title, text, keyword, sentiment_category FROM reddit_posts WHERE sentiment_score IS NOT NULL AND sentiment_score <= 50" +
+                " AND NOT ('" + PASS_NEGATIVE + "' = ANY(sentiment_passes))" +
                 " ORDER BY " + timestampColumn + " DESC NULLS LAST";
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
@@ -352,6 +427,7 @@ public class SentimentAnalysis {
                             sentimentResponse.setCategory(category);
                             updateSentimentScore(conn, "reddit_posts", id, sentimentResponse);
                         }
+                        markPassDone(conn, "reddit_posts", id, PASS_NEGATIVE);
                     } catch (IOException e) {
                         System.err.println("Error calling sentiment analysis API for reddit_posts ID: " + id + ". " + e.getMessage());
                     }
@@ -362,6 +438,7 @@ public class SentimentAnalysis {
 
     private static void processRedditPostsFilterNeutralPosts(Connection conn, String timestampColumn) throws SQLException {
         String sql = "SELECT id, title, text, keyword, sentiment_category FROM reddit_posts WHERE sentiment_score IS NOT NULL AND sentiment_score > 50 AND sentiment_score < 75" +
+                " AND NOT ('" + PASS_NEUTRAL + "' = ANY(sentiment_passes))" +
                 " ORDER BY " + timestampColumn + " DESC NULLS LAST";
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
@@ -382,6 +459,7 @@ public class SentimentAnalysis {
                             sentimentResponse.setCategory(category);
                             updateSentimentScore(conn, "reddit_posts", id, sentimentResponse);
                         }
+                        markPassDone(conn, "reddit_posts", id, PASS_NEUTRAL);
                     } catch (IOException e) {
                         System.err.println("Error calling sentiment analysis API for reddit_posts ID: " + id + ". " + e.getMessage());
                     }
@@ -391,17 +469,14 @@ public class SentimentAnalysis {
     }
 
     private static void processTable(Connection conn, String tableName, String timestampColumn) throws SQLException {
-        // Only score rows that haven't been scored yet, newest timestamp first. Matches
-        // processRedditPosts: a single pass over everything currently unscored, rather than
-        // paginating - a row that keeps failing to score (e.g. an out-of-range LLM response)
-        // would otherwise stay in the WHERE clause forever and make an OFFSET-based loop spin.
+        // Only score rows the initial prompt hasn't run on yet, newest timestamp first, in a capped
+        // pass so classification still gets a turn. Rows already scored (including those scored 0)
+        // are never re-sent to the LLM - see sentiment_passes.
         String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName +
                 " WHERE text IS NOT NULL AND TRIM(text) <> ''" +
                 " AND keyword IS NOT NULL AND TRIM(keyword) <> ''" +
-                " AND (sentiment_score IS NULL OR sentiment_score = 0)" +
-                // Never-scored rows first, and a capped pass: the ~67k rows already scored 0 would
-                // otherwise be re-scored every pass (days at LLM speed), starving classification.
-                " ORDER BY (sentiment_score IS NULL) DESC, " + timestampColumn + " DESC NULLS LAST LIMIT " + PASS_LIMIT;
+                " AND NOT ('" + PASS_INITIAL + "' = ANY(sentiment_passes))" +
+                " ORDER BY " + timestampColumn + " DESC NULLS LAST LIMIT " + PASS_LIMIT;
 
         // Buffer into memory and close the ResultSet before issuing updates.
         java.util.List<String[]> batch = new java.util.ArrayList<>();
@@ -426,6 +501,7 @@ public class SentimentAnalysis {
                 SentimentResponse sentimentResponse = getAverageSentimentScore(text, keyword, category);
                 System.out.println("Updating sentiment score for id (generic): " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
                 updateSentimentScore(conn, tableName, id, sentimentResponse);
+                markPassDone(conn, tableName, id, PASS_INITIAL);
             } catch (IOException e) {
                 System.err.println("Error calling sentiment analysis API for " + tableName + " ID: " + id + ". " + e.getMessage());
             }
@@ -441,10 +517,8 @@ public class SentimentAnalysis {
         String sql = "SELECT id, text, video_title, keyword, sentiment_category FROM youtube_comments" +
                 " WHERE text IS NOT NULL AND TRIM(text) <> ''" +
                 " AND keyword IS NOT NULL AND TRIM(keyword) <> ''" +
-                " AND (sentiment_score IS NULL OR sentiment_score = 0)" +
-                // Never-scored rows first, and a capped pass: the ~67k rows already scored 0 would
-                // otherwise be re-scored every pass (days at LLM speed), starving classification.
-                " ORDER BY (sentiment_score IS NULL) DESC, " + timestampColumn + " DESC NULLS LAST LIMIT " + PASS_LIMIT;
+                " AND NOT ('" + PASS_INITIAL + "' = ANY(sentiment_passes))" +
+                " ORDER BY " + timestampColumn + " DESC NULLS LAST LIMIT " + PASS_LIMIT;
 
         java.util.List<String[]> batch = new java.util.ArrayList<>();
         try (Statement stmt = conn.createStatement();
@@ -471,6 +545,7 @@ public class SentimentAnalysis {
                 SentimentResponse sentimentResponse = getAverageSentimentScore(combinedText, keyword, category);
                 System.out.println("Updating sentiment score for youtube_comments id: " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
                 updateSentimentScore(conn, "youtube_comments", id, sentimentResponse);
+                markPassDone(conn, "youtube_comments", id, PASS_INITIAL);
             } catch (IOException e) {
                 System.err.println("Error calling sentiment analysis API for youtube_comments ID: " + id + ". " + e.getMessage());
             }
@@ -647,6 +722,7 @@ public class SentimentAnalysis {
 
     private static void processTableFilterInvalidPosts(Connection conn, String tableName, String timestampColumn) throws SQLException {
         String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NOT NULL AND sentiment_score > 0" +
+                " AND NOT ('" + PASS_INVALID + "' = ANY(sentiment_passes))" +
                 " ORDER BY " + timestampColumn + " DESC NULLS LAST";//v2
 //        String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE keyword = 'parasakthi' AND text LIKE '%oast%'";
         try (Statement stmt = conn.createStatement();
@@ -667,6 +743,7 @@ public class SentimentAnalysis {
                             sentimentResponse.setCategory(category);
                             updateSentimentScore(conn, tableName, id, sentimentResponse);
                         }
+                        markPassDone(conn, tableName, id, PASS_INVALID);
                     } catch (IOException e) {
                         System.err.println("Error calling sentiment analysis API for " + tableName + " ID: " + id + ". " + e.getMessage());
                     }
@@ -677,6 +754,7 @@ public class SentimentAnalysis {
 
     private static void processTableFilterPositivePosts(Connection conn, String tableName, String timestampColumn) throws SQLException {
         String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NOT NULL AND sentiment_score >= 75" +
+                " AND NOT ('" + PASS_POSITIVE + "' = ANY(sentiment_passes))" +
                 " ORDER BY " + timestampColumn + " DESC NULLS LAST";//v2
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
@@ -696,6 +774,7 @@ public class SentimentAnalysis {
                             sentimentResponse.setCategory(category);
                             updateSentimentScore(conn, tableName, id, sentimentResponse);
                         }
+                        markPassDone(conn, tableName, id, PASS_POSITIVE);
                     } catch (IOException e) {
                         System.err.println("Error calling sentiment analysis API for " + tableName + " ID: " + id + ". " + e.getMessage());
                     }
@@ -706,6 +785,7 @@ public class SentimentAnalysis {
 
     private static void processTableFilterNegativePosts(Connection conn, String tableName, String timestampColumn) throws SQLException {
         String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NOT NULL AND sentiment_score <= 50" +
+                " AND NOT ('" + PASS_NEGATIVE + "' = ANY(sentiment_passes))" +
                 " ORDER BY " + timestampColumn + " DESC NULLS LAST";//v2
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
@@ -725,6 +805,7 @@ public class SentimentAnalysis {
                             sentimentResponse.setCategory(category);
                             updateSentimentScore(conn, tableName, id, sentimentResponse);
                         }
+                        markPassDone(conn, tableName, id, PASS_NEGATIVE);
                     } catch (IOException e) {
                         System.err.println("Error calling sentiment analysis API for " + tableName + " ID: " + id + ". " + e.getMessage());
                     }
@@ -735,6 +816,7 @@ public class SentimentAnalysis {
 
     private static void processTableFilterNeutralPosts(Connection conn, String tableName, String timestampColumn) throws SQLException {
         String sql = "SELECT id, text, keyword, sentiment_category FROM " + tableName + " WHERE sentiment_score IS NOT NULL AND sentiment_score > 50 AND sentiment_score < 75" +
+                " AND NOT ('" + PASS_NEUTRAL + "' = ANY(sentiment_passes))" +
                 " ORDER BY " + timestampColumn + " DESC NULLS LAST";//v2
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
@@ -754,6 +836,7 @@ public class SentimentAnalysis {
                             sentimentResponse.setCategory(category);
                             updateSentimentScore(conn, tableName, id, sentimentResponse);
                         }
+                        markPassDone(conn, tableName, id, PASS_NEUTRAL);
                     } catch (IOException e) {
                         System.err.println("Error calling sentiment analysis API for " + tableName + " ID: " + id + ". " + e.getMessage());
                     }
